@@ -22,6 +22,7 @@ package main
 
 import (
 	"bufio"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log"
@@ -35,7 +36,14 @@ import (
 
 var errInvalidRequest = errors.New("Invalid request line")
 
-var REQUEST_LINE_REGEX, _ = regexp.Compile("GET (?http[s]*://)*(\\S+?)[:]*([\\d]+)*[/]* HTTP/1.1")
+var REQUEST_LINE_REGEX, _ = regexp.Compile("(GET|CONNECT) (?:http[s]*://)*(\\S+?)[:]*([\\d]+)*[/]* HTTP/1.1")
+
+type Request struct {
+	headers map[string]string
+	method string
+	port string
+	URI string
+}
 
 func isValidHTTPRequest(requestLine string) bool {
 	if !REQUEST_LINE_REGEX.MatchString(requestLine) {
@@ -44,18 +52,20 @@ func isValidHTTPRequest(requestLine string) bool {
 	return true
 }
 
-func parseMessage(request string) (map[string]string, string, string, error) {
-	scanner := bufio.NewScanner(strings.NewReader(request))
+func parseMessage(message string) (Request, error) {
+	scanner := bufio.NewScanner(strings.NewReader(message))
 	scanner.Scan()
 	requestLine := scanner.Text()
 	if !isValidHTTPRequest(requestLine) {
-		return map[string]string{}, "", "", errInvalidRequest
+		return Request{}, errInvalidRequest
 	}
 
 	matches := REQUEST_LINE_REGEX.FindStringSubmatch(requestLine)
-	requestURI := matches[1]
-	port := matches[2]
-	fmt.Printf("Request URI: %s\n", requestURI)
+	method := matches[1]
+	URI := matches[2]
+	port := matches[3]
+	fmt.Printf("Method: %s\n", method)
+	fmt.Printf("Request URI: %s\n", URI)
 	fmt.Printf("Port: %s\n", port)
 
 	headers := make(map[string]string)
@@ -67,44 +77,85 @@ func parseMessage(request string) (map[string]string, string, string, error) {
 		header := strings.Split(line, ": ")
 		headers[header[0]] = header[1]
 	}
-	return headers, requestURI, port, nil
+	return Request{method: method, URI: URI, headers: headers, port:port}, nil
 }
 
-func makeUpstreamRequest(message string, requestURI string, port string) string {
-	if port == "" {
-		port = "80"
+func makeUpstreamRequest(message string, request Request) string {
+	if request.port == "" {
+		request.port = "80"
 	}
-	fmt.Println(port)
-	conn, err := net.Dial("tcp", requestURI + ":" + port)
+	fmt.Println(request.port)
+	fmt.Println(request.URI + ":" + request.port)
+//	dialer := net.Dialer{KeepAlive: headers['KeepAlive']
+	conn, err := tls.Dial("tcp", request.URI + ":" + request.port, &tls.Config{})
 	if err != nil {
 		log.Print(err)
 		return ""
 	}
+	log.Printf("Writing message to socket: %s\n", message)
 	conn.Write([]byte(message))
 	p := make([]byte, 4096)
-	response, err := conn.Read(p)
+	_, err = conn.Read(p)
+	log.Println("Reading message from socket: ", string(p))
 	if err != nil {
 		log.Print(err)
 		return ""
 	}
-	return string(response)
+	return string(p)
 }
 
-func handleConnection(conn net.Conn) error {
+func handleConnection(conn net.Conn) (string, error) {
 	p := make([]byte, 4096)
 	_, err := conn.Read(p)
 	if err != nil {
-		log.Fatal(err)
+		return "", err
 	}
 	message := string(p)
 	log.Print(message)
-	_, requestURI, port, err := parseMessage(message)
+	request, err := parseMessage(message)
 	if err != nil {
-		return err
+		return "", err
 	}
-	response := makeUpstreamRequest(message, requestURI, port)
+	var response string
+	if request.method == "CONNECT" {
+		log.Print("Dialing")
+//		upstreamConn, err := net.Dial(
+//			"tcp", request.URI + ":" + request.port,
+//		)
+		upstreamConn, err := net.Dial(
+			"tcp", request.URI + ":" + request.port, &tls.Config{},
+		)
+		if err != nil {
+			return "", err
+		}
+		log.Print("Writing")
+		conn.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
+		log.Print("Reading")
+		p := make([]byte, 4096)
+		_, err = conn.Read(p)
+		log.Print("Read")
+		if err != nil {
+			return "", err
+		}
+		message = string(p)
+		log.Printf("Writing upstream:\n%s", message)
+		request, err = parseMessage(message)
+		upstreamConn.Write(p)
+		log.Print("Reading")
+		buf := make([]byte, 10000)
+		n, err := upstreamConn.Read(buf)
+		log.Printf("Read %d bytes from upstream", n)
+		conn.Write(buf)
+		n, err = conn.Read(buf)
+		log.Printf("Read %d bytes from downstream", n)
+		upstreamConn.Write(buf)
+		n, err = upstreamConn.Read(buf)
+		return "", nil
+	} else {
+		response = makeUpstreamRequest(message, request)
+	}
 	log.Print(response)
-	return nil
+	return response, nil
 }
 
 func runProxy(listenPort string) {
@@ -121,7 +172,7 @@ func runProxy(listenPort string) {
 			log.Print(err)
 			continue
 		}
-		err = handleConnection(conn)
+		response, err := handleConnection(conn)
 		if err != nil {
 			switch err {
 			case errInvalidRequest:
@@ -137,7 +188,9 @@ func runProxy(listenPort string) {
 				log.Fatal(err)
 			}
 		}
-		conn.Close()
+		if len(response) > 0 {
+			conn.Write([]byte(response))
+		}
 	}
 }
 
