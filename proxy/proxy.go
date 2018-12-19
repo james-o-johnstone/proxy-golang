@@ -22,9 +22,11 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -36,7 +38,7 @@ import (
 
 var errInvalidRequest = errors.New("Invalid request line")
 
-var REQUEST_LINE_REGEX, _ = regexp.Compile("(GET|CONNECT) (?:http[s]*://)*(\\S+?)[:]*([\\d]+)*[/]* HTTP/1.1")
+var REQUEST_LINE_REGEX, _ = regexp.Compile(`(GET|CONNECT|POST) (?:http[s]*://)*(\S+?)(?:[:]([\d]+))*[/]* HTTP/1.1`)
 
 type Request struct {
 	headers map[string]string
@@ -104,58 +106,112 @@ func makeUpstreamRequest(message string, request Request) string {
 	return string(p)
 }
 
-func handleConnection(conn net.Conn) (string, error) {
-	p := make([]byte, 4096)
-	_, err := conn.Read(p)
+func read(conn net.Conn) ([]byte, error) {
+	var rBuffer bytes.Buffer
+	nReadTot := 0
+	connReader := bufio.NewReader(conn)
+	rTempBuf := make([]byte, 4096)
+//	size, err := connReader.ReadByte()
+//	log.Printf("Packet size: %d\n", size)
+//	if err != nil {
+//		if err != io.EOF{
+//			log.Fatal(err)
+//		}
+//		log.Print("EOF Reached")
+//		return rBuffer.Bytes()
+//	}
+
+	n, err := connReader.Read(rTempBuf)
 	if err != nil {
-		return "", err
+		if err != io.EOF{
+			log.Print(err)
+			return make([]byte, 0), err
+		}
+		log.Print("EOF Reached")
+		return rTempBuf, nil
 	}
-	message := string(p)
+//		n, err := conn.Read(rTempBuf)
+//		if err != nil {
+//			if err != io.EOF {
+//				log.Fatal(err)
+//			}
+//			log.Print("EOF reached")
+//			break
+//		}
+	log.Printf("Read: %d bytes\n", n)
+	rBuffer.Write(rTempBuf)
+	nReadTot += n
+	log.Printf("Read Total: %d bytes\n", nReadTot)
+	return rBuffer.Bytes(), nil
+}
+
+func transfer(destination io.WriteCloser, source io.ReadCloser) {
+	defer destination.Close()
+	defer source.Close()
+	io.Copy(destination, source)
+}
+
+func handleConnection(conn net.Conn) error {
+	downstreamBytesRead := make([]byte, 4096)
+	_, err := conn.Read(downstreamBytesRead)
+	if err != nil {
+		return err
+	}
+	message := string(downstreamBytesRead)
 	log.Print(message)
 	request, err := parseMessage(message)
 	if err != nil {
-		return "", err
+		return err
 	}
-	var response string
+	var upstreamConn net.Conn
 	if request.method == "CONNECT" {
-		log.Print("Dialing")
-//		upstreamConn, err := net.Dial(
-//			"tcp", request.URI + ":" + request.port,
-//		)
-		upstreamConn, err := net.Dial(
-			"tcp", request.URI + ":" + request.port, &tls.Config{},
+		// open socket to create tunnel to upstream then send 200 OK back to downstream
+		log.Printf("Dialing: %s\n", request.URI + ":" + request.port)
+		upstreamConn, err = net.Dial(
+			"tcp", request.URI + ":" + request.port,
 		)
 		if err != nil {
-			return "", err
+			return err
 		}
-		log.Print("Writing")
+//		upstreamConn, err := tls.Dial(
+//			"tcp", request.URI + ":" + request.port, &tls.Config{},
+//		)
+		log.Print("Writing downstream CONNECT OK")
 		conn.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
-		log.Print("Reading")
-		p := make([]byte, 4096)
-		_, err = conn.Read(p)
-		log.Print("Read")
-		if err != nil {
-			return "", err
-		}
-		message = string(p)
-		log.Printf("Writing upstream:\n%s", message)
-		request, err = parseMessage(message)
-		upstreamConn.Write(p)
-		log.Print("Reading")
-		buf := make([]byte, 10000)
-		n, err := upstreamConn.Read(buf)
-		log.Printf("Read %d bytes from upstream", n)
-		conn.Write(buf)
-		n, err = conn.Read(buf)
-		log.Printf("Read %d bytes from downstream", n)
-		upstreamConn.Write(buf)
-		n, err = upstreamConn.Read(buf)
-		return "", nil
+//		go transfer(upstreamConn, conn)
+//		go transfer(conn, upstreamConn)
 	} else {
-		response = makeUpstreamRequest(message, request)
+		// if not CONNECT then just open socket and write the initial client request
+		upstreamConn, err = net.Dial(
+			"tcp", request.URI + ":" + request.port,
+		)
+		if err != nil {
+			return err
+		}
+		_, err = upstreamConn.Write(downstreamBytesRead)
+		upstreamBytesRead := make([]byte, 4096)
+		_, err = upstreamConn.Read(upstreamBytesRead)
+		conn.Write(upstreamBytesRead)
 	}
-	log.Print(response)
-	return response, nil
+
+	// pass data to/from the client until comms have stopped
+	for {
+		log.Print("Reading from downstream")
+		readDownstream, err := read(conn)
+		if err != nil {
+			break
+		}
+		log.Print("Writing to upstream")
+		upstreamConn.Write(readDownstream)
+		log.Print("Reading from upstream")
+		readUpstream, err := read(upstreamConn)
+		if err != nil {
+			break
+		}
+		log.Print("Writing to downstream")
+		conn.Write(readUpstream)
+	}
+	return nil
 }
 
 func runProxy(listenPort string) {
@@ -168,29 +224,31 @@ func runProxy(listenPort string) {
 
 	for {
 		conn, err := listener.Accept()
+		log.Print("Accepting new connection")
 		if err != nil {
 			log.Print(err)
 			continue
 		}
-		response, err := handleConnection(conn)
-		if err != nil {
-			switch err {
-			case errInvalidRequest:
-				response := fmt.Sprintf("HTTP/1.1 400 Bad Request\n" +
-				"Date: %s\n" +
-				"Content-Length: 0\n" +
-				"Content-Type: text/html; charset=UTF-8\n" +
-				"Connection: Closed\r\n",
-				time.Now().UTC().Format(http.TimeFormat))
-				log.Printf("Response:\n%s", response)
-				conn.Write([]byte(response))
-			default:
-				log.Fatal(err)
+		go func() {
+			err := handleConnection(conn)
+			if err != nil {
+				switch err {
+				case errInvalidRequest:
+					response := fmt.Sprintf("HTTP/1.1 400 Bad Request\n" +
+					"Date: %s\n" +
+					"Content-Length: 0\n" +
+					"Content-Type: text/html; charset=UTF-8\n" +
+					"Connection: Closed\r\n",
+					time.Now().UTC().Format(http.TimeFormat))
+					log.Printf("Response:\n%s", response)
+					conn.Write([]byte(response))
+					conn.Close()
+				default:
+					log.Print(err)
+				}
 			}
-		}
-		if len(response) > 0 {
-			conn.Write([]byte(response))
-		}
+			conn.Close()
+		}()
 	}
 }
 
