@@ -17,7 +17,7 @@ import (
 
 var errInvalidRequest = errors.New("Invalid request line")
 
-var REQUEST_LINE_REGEX, _ = regexp.Compile(`(GET|CONNECT|POST) (?:(http[s]*)://)*(\S+?)(?:[:]([\d]+))*[/]* HTTP/1.1`)
+var requestLineRegex, _ = regexp.Compile(`(GET|CONNECT|POST) (?:(http[s]*)://)*(\S+?)(?:[:]([\d]+))*[/]* HTTP/1.1`)
 
 type Request struct {
 	headers map[string]string
@@ -27,7 +27,7 @@ type Request struct {
 }
 
 func isValidHTTPRequest(requestLine string) bool {
-	if !REQUEST_LINE_REGEX.MatchString(requestLine) {
+	if !requestLineRegex.MatchString(requestLine) {
 		return false
 	}
 	return true
@@ -41,7 +41,7 @@ func parseMessage(message string) (Request, error) {
 		return Request{}, errInvalidRequest
 	}
 
-	matches := REQUEST_LINE_REGEX.FindStringSubmatch(requestLine)
+	matches := requestLineRegex.FindStringSubmatch(requestLine)
 	method := matches[1]
 	proto := matches[2]
 	URI := matches[3]
