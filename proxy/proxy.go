@@ -1,29 +1,7 @@
 package main
 
-//build a basic web proxy capable of accepting HTTP requests, making requests from remote servers, caching results, and returning data to a client.
-
-// establish socket connection for listening to incoing conns
-// read data from client and check for properly formatted http req
-// invalid req should have error code
-
-// parse URL from HTTP req - host, port and path
-
-// check if the object is already cached - return from cache
-
-// make connection to requested host using remote port or default of 80
-// send http request received from client to the remote server
-
-// cache object to disk after downloading, dont cache if marked no-cache or private (see RFC)
-// only cache if returned with status code 200
-
-// send response to client via the socket, close connection
-
-// browser e.g. firefox might send multple requests to get images -need threading in that case
-
 import (
 	"bufio"
-	"bytes"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -33,18 +11,19 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
 var errInvalidRequest = errors.New("Invalid request line")
 
-var REQUEST_LINE_REGEX, _ = regexp.Compile(`(GET|CONNECT|POST) (?:http[s]*://)*(\S+?)(?:[:]([\d]+))*[/]* HTTP/1.1`)
+var REQUEST_LINE_REGEX, _ = regexp.Compile(`(GET|CONNECT|POST) (?:(http[s]*)://)*(\S+?)(?:[:]([\d]+))*[/]* HTTP/1.1`)
 
 type Request struct {
 	headers map[string]string
-	method string
-	port string
-	URI string
+	method  string
+	port    string
+	URI     string
 }
 
 func isValidHTTPRequest(requestLine string) bool {
@@ -64,11 +43,15 @@ func parseMessage(message string) (Request, error) {
 
 	matches := REQUEST_LINE_REGEX.FindStringSubmatch(requestLine)
 	method := matches[1]
-	URI := matches[2]
-	port := matches[3]
-	fmt.Printf("Method: %s\n", method)
-	fmt.Printf("Request URI: %s\n", URI)
-	fmt.Printf("Port: %s\n", port)
+	proto := matches[2]
+	URI := matches[3]
+	port := matches[4]
+	if port == "" && proto == "https" {
+		port = "443"
+	} else if port == "" && proto == "http" {
+		port = "80"
+	}
+	log.Printf("Proto: %s, Method: %s, Request URI: %s, Port: %s", proto, method, URI, port)
 
 	headers := make(map[string]string)
 	for scanner.Scan() {
@@ -79,70 +62,28 @@ func parseMessage(message string) (Request, error) {
 		header := strings.Split(line, ": ")
 		headers[header[0]] = header[1]
 	}
-	return Request{method: method, URI: URI, headers: headers, port:port}, nil
+	return Request{method: method, URI: URI, headers: headers, port: port}, nil
 }
 
-func makeUpstreamRequest(message string, request Request) string {
-	if request.port == "" {
-		request.port = "80"
-	}
-	fmt.Println(request.port)
-	fmt.Println(request.URI + ":" + request.port)
-//	dialer := net.Dialer{KeepAlive: headers['KeepAlive']
-	conn, err := tls.Dial("tcp", request.URI + ":" + request.port, &tls.Config{})
-	if err != nil {
-		log.Print(err)
-		return ""
-	}
-	log.Printf("Writing message to socket: %s\n", message)
-	conn.Write([]byte(message))
-	p := make([]byte, 4096)
-	_, err = conn.Read(p)
-	log.Println("Reading message from socket: ", string(p))
-	if err != nil {
-		log.Print(err)
-		return ""
-	}
-	return string(p)
-}
-
-func read(conn net.Conn) ([]byte, error) {
-	var rBuffer bytes.Buffer
-	nReadTot := 0
+func read(conn net.Conn) (string, error) {
 	connReader := bufio.NewReader(conn)
-	rTempBuf := make([]byte, 4096)
-//	size, err := connReader.ReadByte()
-//	log.Printf("Packet size: %d\n", size)
-//	if err != nil {
-//		if err != io.EOF{
-//			log.Fatal(err)
-//		}
-//		log.Print("EOF Reached")
-//		return rBuffer.Bytes()
-//	}
-
-	n, err := connReader.Read(rTempBuf)
-	if err != nil {
-		if err != io.EOF{
-			log.Print(err)
-			return make([]byte, 0), err
+	var HTTPReqBuilder strings.Builder
+	var HTTPReq string
+	for {
+		tempBuf := make([]byte, 100)
+		_, err := connReader.Read(tempBuf)
+		if err != nil {
+			if err != io.EOF {
+				log.Print(err)
+				return "", err
+			}
 		}
-		log.Print("EOF Reached")
-		return rTempBuf, nil
+		HTTPReqBuilder.WriteString(strings.TrimRight(string(tempBuf), "\x00"))
+		HTTPReq = HTTPReqBuilder.String()
+		if len(HTTPReq) >= 4 && HTTPReq[len(HTTPReq)-4:] == "\r\n\r\n" {
+			return HTTPReq, nil
+		}
 	}
-//		n, err := conn.Read(rTempBuf)
-//		if err != nil {
-//			if err != io.EOF {
-//				log.Fatal(err)
-//			}
-//			log.Print("EOF reached")
-//			break
-//		}
-	log.Printf("Read: %d bytes\n", n)
-	rBuffer.Write(rTempBuf)
-	nReadTot += n
-	log.Printf("Read Total: %d bytes\n", nReadTot)
-	return rBuffer.Bytes(), nil
 }
 
 func transfer(destination io.WriteCloser, source io.ReadCloser) {
@@ -151,104 +92,93 @@ func transfer(destination io.WriteCloser, source io.ReadCloser) {
 	io.Copy(destination, source)
 }
 
-func handleConnection(conn net.Conn) error {
-	downstreamBytesRead := make([]byte, 4096)
-	_, err := conn.Read(downstreamBytesRead)
+func proxy(upstream net.Conn, client net.Conn) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		transfer(upstream, client)
+		wg.Done()
+	}()
+	go func() {
+		transfer(client, upstream)
+		wg.Done()
+	}()
+	wg.Wait()
+}
+
+func handleConnection(clientConn net.Conn) error {
+	clientRawRequest, err := read(clientConn)
 	if err != nil {
 		return err
 	}
-	message := string(downstreamBytesRead)
-	log.Print(message)
-	request, err := parseMessage(message)
+	log.Printf("Read from client:\n%s", clientRawRequest)
+	request, err := parseMessage(clientRawRequest)
 	if err != nil {
 		return err
-	}
-	var upstreamConn net.Conn
-	if request.method == "CONNECT" {
-		// open socket to create tunnel to upstream then send 200 OK back to downstream
-		log.Printf("Dialing: %s\n", request.URI + ":" + request.port)
-		upstreamConn, err = net.Dial(
-			"tcp", request.URI + ":" + request.port,
-		)
-		if err != nil {
-			return err
-		}
-//		upstreamConn, err := tls.Dial(
-//			"tcp", request.URI + ":" + request.port, &tls.Config{},
-//		)
-		log.Print("Writing downstream CONNECT OK")
-		conn.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
-//		go transfer(upstreamConn, conn)
-//		go transfer(conn, upstreamConn)
-	} else {
-		// if not CONNECT then just open socket and write the initial client request
-		upstreamConn, err = net.Dial(
-			"tcp", request.URI + ":" + request.port,
-		)
-		if err != nil {
-			return err
-		}
-		_, err = upstreamConn.Write(downstreamBytesRead)
-		upstreamBytesRead := make([]byte, 4096)
-		_, err = upstreamConn.Read(upstreamBytesRead)
-		conn.Write(upstreamBytesRead)
 	}
 
-	// pass data to/from the client until comms have stopped
-	for {
-		log.Print("Reading from downstream")
-		readDownstream, err := read(conn)
-		if err != nil {
-			break
-		}
-		log.Print("Writing to upstream")
-		upstreamConn.Write(readDownstream)
-		log.Print("Reading from upstream")
-		readUpstream, err := read(upstreamConn)
-		if err != nil {
-			break
-		}
-		log.Print("Writing to downstream")
-		conn.Write(readUpstream)
+	var serverConn net.Conn
+	log.Printf("Dialing: %s\n", request.URI+":"+request.port)
+	serverConn, err = net.Dial(
+		"tcp", request.URI+":"+request.port,
+	)
+	if err != nil {
+		return err
 	}
+	if request.method == "CONNECT" {
+		log.Print("Writing CONNECT OK to client")
+		clientConn.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
+
+		log.Print("Proxying TCP byte stream")
+		proxy(serverConn, clientConn)
+	} else {
+		serverConn.Write([]byte(clientRawRequest))
+		rawResponse, err := read(serverConn)
+		if err != nil {
+			return err
+		}
+		log.Printf("Read from server:\n%s", string(rawResponse))
+		clientConn.Write([]byte(rawResponse))
+	}
+	log.Printf("Finished handling connection to: %s", request.URI+":"+request.port)
 	return nil
 }
 
 func runProxy(listenPort string) {
-	listener, err := net.Listen("tcp", ":" + listenPort)
+	listener, err := net.Listen("tcp", ":"+listenPort)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	log.Print("Listening on:", listenPort)
+	log.Print("Listening to port: ", listenPort)
 
 	for {
 		conn, err := listener.Accept()
-		log.Print("Accepting new connection")
 		if err != nil {
 			log.Print(err)
 			continue
 		}
-		go func() {
-			err := handleConnection(conn)
+		log.Print("Accepted new connection")
+		go func(c net.Conn) {
+			err := handleConnection(c)
 			if err != nil {
 				switch err {
 				case errInvalidRequest:
-					response := fmt.Sprintf("HTTP/1.1 400 Bad Request\n" +
-					"Date: %s\n" +
-					"Content-Length: 0\n" +
-					"Content-Type: text/html; charset=UTF-8\n" +
-					"Connection: Closed\r\n",
-					time.Now().UTC().Format(http.TimeFormat))
+					response := fmt.Sprintf("HTTP/1.1 400 Bad Request\n"+
+						"Date: %s\n"+
+						"Content-Length: 0\n"+
+						"Content-Type: text/html; charset=UTF-8\n"+
+						"Connection: Closed\r\n",
+						time.Now().UTC().Format(http.TimeFormat))
 					log.Printf("Response:\n%s", response)
-					conn.Write([]byte(response))
-					conn.Close()
+					c.Write([]byte(response))
 				default:
 					log.Print(err)
 				}
 			}
-			conn.Close()
-		}()
+			log.Print("Closing connection")
+			c.Close()
+		}(conn)
 	}
 }
 
